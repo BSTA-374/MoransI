@@ -1,0 +1,524 @@
+---
+title: "Spatial Autocorrelation: Global and Local Moran's I"
+subtitle: "Do high SIRs sit next to high SIRs?"
+author: "Eric M. Delmelle · Lehigh University"
+format:
+  html:
+    theme: cosmo
+    toc: true
+    toc-depth: 2
+    toc-location: left
+    toc-title: "On this page"
+    number-sections: true
+    code-fold: show
+    code-copy: true
+    code-tools: true
+    code-line-numbers: true
+    highlight-style: github
+    fig-width: 7
+    fig-height: 5
+    fig-align: center
+    df-print: kable
+    embed-resources: true
+  pdf:
+    papersize: letter
+    geometry:
+      - margin=1in
+    toc: false
+    colorlinks: true
+    code-overflow: wrap
+execute:
+  warning: false
+  message: false
+---
+
+::: {.callout-tip appearance="simple"}
+**Get the source.** [Download `index.qmd`](https://github.com/BSTA-374/MoranI/raw/main/index.qmd) ---
+open it in RStudio and run the chunks alongside this page.
+:::
+
+## Where we left off {.unnumbered}
+
+Last time we turned Pennsylvania's lung cancer cases into expected counts and
+SIRs. Looking at the SIR map, the eye starts to see patterns: a darker patch
+here, a lighter one there. Today we ask whether those patterns are real, in two
+steps.
+
+1. **Global Moran's I** --- one number for the whole state: do similar SIRs
+   tend to sit next to each other?
+2. **Local Moran's I (LISA)** --- one number per county: *where* are the
+   clusters and the outliers?
+
+Between the two, we use **simulation** to decide what "more clustered than
+chance" means. Reading: **Rogerson & Yamada Ch. 3--4**.
+
+```{r}
+#| label: setup
+#| code-fold: false
+
+library(sf)
+library(dplyr)
+library(ggplot2)
+library(patchwork)
+library(spdep)        # neighbours, weights, Moran's I
+library(SpatialEpi)   # pennLC data
+
+theme_set(theme_classic(base_size = 12))
+```
+
+::: {.callout-note}
+If `spdep` is missing, `install.packages("spdep")` once.
+:::
+
+---
+
+# Back to the SIR map
+
+We rebuild the observed and expected counts from last lecture in one chunk.
+
+```{r}
+#| label: rebuild-sir
+#| code-fold: true
+
+data(pennLC)
+d <- pennLC$data
+
+ref <- d |>
+  group_by(race, gender, age) |>
+  summarise(r = sum(cases) / sum(population), .groups = "drop")   # 16 reference rates
+
+county <- d |>
+  left_join(ref, by = c("race", "gender", "age")) |>
+  group_by(county) |>
+  summarise(O = sum(cases), E = sum(population * r), .groups = "drop") |>
+  mutate(SIR = O / E)
+
+pa <- st_as_sf(pennLC$spatial.polygon) |>
+  st_set_crs(4326) |>
+  mutate(county = names(pennLC$spatial.polygon)) |>
+  st_transform(5070) |>                                           # Albers, metres
+  left_join(county, by = "county")
+
+sir_breaks <- c(0, 0.67, 0.83, 0.95, 1.05, 1.2, 1.5, Inf)
+sir_fill   <- scale_fill_brewer(palette = "RdBu", direction = -1, drop = FALSE, name = "SIR")
+```
+
+```{r}
+#| label: fig-sir
+#| fig-height: 4.5
+#| fig-cap: "Raw SIRs for lung cancer, Pennsylvania 2002."
+
+ggplot(pa) +
+  geom_sf(aes(fill = cut(SIR, sir_breaks)), colour = "white", linewidth = 0.2) +
+  sir_fill +
+  theme_void()
+```
+
+Our eyes are good at finding patterns, including ones that are not there. We
+need (a) a definition of "nearby" and (b) a measure of how similar nearby
+values are.
+
+---
+
+# Who is a neighbour?
+
+## Queen contiguity
+
+Two counties are neighbours if they share a border or even a single corner
+(like the queen in chess). `poly2nb()` builds the list.
+
+```{r}
+#| label: neighbours
+
+nb <- poly2nb(pa, queen = TRUE)
+summary(card(nb))                               # neighbours per county
+```
+
+```{r}
+#| label: fig-nb
+#| fig-height: 4.5
+#| fig-cap: "Queen-contiguity links between county centres. Lehigh and its neighbours are highlighted."
+
+pts   <- st_point_on_surface(st_geometry(pa))
+links <- nb2lines(nb, coords = pts, as_sf = TRUE) |>
+  st_set_crs(st_crs(pa))
+
+i_leh <- which(pa$county == "lehigh")
+pa$role <- "other"
+pa$role[nb[[i_leh]]] <- "neighbour"
+pa$role[i_leh] <- "Lehigh"
+
+ggplot() +
+  geom_sf(data = pa, aes(fill = role), colour = "white", linewidth = 0.3) +
+  geom_sf(data = links, colour = "grey30", linewidth = 0.25) +
+  geom_sf(data = pts, size = 0.6) +
+  scale_fill_manual(values = c(Lehigh = "#b2182b", neighbour = "#fdae61", other = "grey90"),
+                    name = NULL) +
+  theme_void()
+```
+
+Other choices exist --- rook contiguity (shared edges only), the *k* nearest
+centroids, or a distance band --- and the answer can depend on the choice.
+Contiguity is the usual default for counties.
+
+## Row-standardized weights
+
+We turn the list into weights. With `style = "W"`, each county's neighbours get
+equal weight and the weights sum to 1, so "the neighbours' value" is simply
+their **average**.
+
+```{r}
+#| label: weights
+
+lw <- nb2listw(nb, style = "W")
+
+lw$weights[[i_leh]]                             # Lehigh: equal shares
+```
+
+## The spatial lag
+
+The **spatial lag** of a county is the average SIR of its neighbours. Mapping
+it next to the SIR is the most intuitive way to see autocorrelation: if the two
+maps look alike, neighbours resemble each other.
+
+```{r}
+#| label: fig-lag
+#| fig-height: 4
+#| fig-cap: "Each county's own SIR (left) and the average SIR of its neighbours (right)."
+
+pa$SIR_lag <- lag.listw(lw, pa$SIR)
+
+m_own <- ggplot(pa) +
+  geom_sf(aes(fill = cut(SIR, sir_breaks)), colour = "white", linewidth = 0.2) +
+  sir_fill + labs(title = "Own SIR")
+
+m_lag <- ggplot(pa) +
+  geom_sf(aes(fill = cut(SIR_lag, sir_breaks)), colour = "white", linewidth = 0.2) +
+  sir_fill + labs(title = "Neighbours' average")
+
+(m_own | m_lag) + plot_layout(guides = "collect") & theme_void()
+```
+
+The lag map is smoother, as averages always are. The question is whether
+high-SIR counties tend to have high-SIR neighbours.
+
+---
+
+# Global Moran's I
+
+## The Moran scatterplot
+
+Plot each county's (standardized) SIR against its neighbours' average.
+
+```{r}
+#| label: fig-moran-scatter
+#| fig-height: 5
+#| fig-cap: "Moran scatterplot. The slope of the line is Moran's I."
+
+pa <- pa |>
+  mutate(z     = as.numeric(scale(SIR)),        # standardized SIR
+         z_lag = lag.listw(lw, z))              # neighbours' average
+
+ggplot(pa, aes(z, z_lag)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey60") +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey60") +
+  geom_point(aes(size = E), alpha = 0.5, colour = "steelblue") +
+  geom_smooth(method = "lm", se = FALSE, colour = "#b2182b", linewidth = 0.8) +
+  geom_text(data = \(x) slice_max(x, abs(z * z_lag), n = 5),
+            aes(label = county), size = 3, vjust = -0.8) +
+  annotate("label", x = Inf, y = Inf, label = "High-High", hjust = 1.1, vjust = 1.3, colour = "#d7191c") +
+  annotate("label", x = -Inf, y = -Inf, label = "Low-Low", hjust = -0.1, vjust = -0.3, colour = "#2c7bb6") +
+  annotate("label", x = Inf, y = -Inf, label = "High-Low", hjust = 1.1, vjust = -0.3, colour = "grey40") +
+  annotate("label", x = -Inf, y = Inf, label = "Low-High", hjust = -0.1, vjust = 1.3, colour = "grey40") +
+  labs(x = "SIR (standardized)", y = "Neighbours' average (standardized)", size = "Expected")
+```
+
+Points in the **High-High** and **Low-Low** quadrants push the slope up
+(similar neighbours); points in **High-Low** and **Low-High** pull it down
+(dissimilar neighbours). With row-standardized weights, the slope of this line
+*is* Moran's I.
+
+## The statistic
+
+$$
+I = \frac{n}{\sum_i\sum_j w_{ij}} \cdot
+    \frac{\sum_i \sum_j w_{ij}\,(x_i-\bar x)(x_j-\bar x)}{\sum_i (x_i-\bar x)^2}
+$$
+
+Read it as a correlation between each value and its neighbours' values. Values
+near 0 suggest no pattern (strictly, the null expectation is $-1/(n-1)$, about
+$-0.015$ for 67 counties); positive values mean similar values cluster;
+negative values mean a checkerboard, which is rare for disease data.
+
+```{r}
+#| label: moran-slope
+
+mi <- moran.test(pa$SIR, lw)
+
+c(slope     = unname(coef(lm(z_lag ~ z, data = pa))[2]),
+  Moran_I   = unname(mi$estimate[1]),
+  expected  = unname(mi$estimate[2]))
+```
+
+The two numbers agree: Moran's I for lung cancer SIRs is
+`r round(mi$estimate[1], 3)`. Is that large? On its own, we cannot tell.
+That is what simulation is for.
+
+---
+
+# Is it more than chance? Simulation
+
+## Shuffle the map
+
+The null hypothesis says location does not matter: any county could have had
+any SIR. So we **shuffle** the 67 SIRs at random across the counties and look
+at the result.
+
+```{r}
+#| label: fig-shuffle
+#| fig-height: 6
+#| fig-cap: "The real SIR map (top left) and three random shufflings of the same 67 values."
+
+set.seed(374)
+shuffled <- bind_rows(
+  pa |> mutate(panel = "Observed"),
+  pa |> mutate(SIR = sample(SIR), panel = "Shuffle 1"),
+  pa |> mutate(SIR = sample(SIR), panel = "Shuffle 2"),
+  pa |> mutate(SIR = sample(SIR), panel = "Shuffle 3")
+)
+
+ggplot(shuffled) +
+  geom_sf(aes(fill = cut(SIR, sir_breaks)), colour = "white", linewidth = 0.1) +
+  sir_fill +
+  facet_wrap(~ panel) +
+  theme_void()
+```
+
+Same values, same colours, different arrangement. Can you pick out the real
+map? If not easily, the pattern may be weak. Moran's I turns this eyeball test
+into a number.
+
+## Do it 999 times
+
+`moran.mc()` shuffles the values 999 times, computes I each time, and compares
+the observed I with the shuffled ones.
+
+```{r}
+#| label: moran-mc
+
+set.seed(374)
+mc <- moran.mc(pa$SIR, lw, nsim = 999)
+mc
+```
+
+```{r}
+#| label: fig-mc-hist
+#| fig-height: 3.5
+#| fig-cap: "Moran's I under 999 random shufflings (grey) and the observed value (red)."
+
+sims <- data.frame(I = head(mc$res, -1))        # last element is the observed I
+
+ggplot(sims, aes(I)) +
+  geom_histogram(bins = 40, fill = "grey75", colour = "white") +
+  geom_vline(xintercept = mc$statistic, colour = "#b2182b", linewidth = 1) +
+  geom_vline(xintercept = -1 / (nrow(pa) - 1), linetype = "dashed") +
+  labs(x = "Moran's I", y = "Number of shuffles")
+```
+
+The pseudo *p*-value counts how many shuffles did at least as well as the real
+map:
+
+$$
+p = \frac{R + 1}{999 + 1},
+$$
+
+where $R$ is the number of shuffled I's at or above the observed one. Here
+$p =$ `r signif(mc$p.value, 2)`. With 999 shuffles, the smallest possible
+value is 0.001; more shuffles give finer resolution, not stronger evidence.
+
+::: {.callout-important}
+## SIRs are not equally reliable
+The shuffle treats Forest County (a handful of expected cases) and
+Philadelphia (over a thousand) as interchangeable. Small counties produce
+extreme SIRs by chance, and those extremes can create or hide apparent
+clustering. An Empirical Bayes version of Moran's I (`spdep::EBImoran.mc()`,
+Assunção & Reis 1999) adjusts for this; we return to it with smoothing.
+:::
+
+---
+
+# Local Moran's I (LISA)
+
+## From one number to 67
+
+Global I says *whether* the map is clustered, not *where*. The local version
+gives each county its own value:
+
+$$
+I_i \propto (x_i - \bar x) \times \text{average of } (x_j - \bar x) \text{ over neighbours } j.
+$$
+
+Positive $I_i$: the county resembles its neighbours (High-High or Low-Low).
+Negative $I_i$: it differs from them (High-Low or Low-High). The local values
+average to the global I --- each county's share of the overall pattern.
+
+## Conditional permutation
+
+Significance is again simulated, with one twist: county $i$ is **held fixed**
+and only the other values are shuffled around it. This asks whether $i$'s
+particular neighbourhood is unusual, given $i$'s own value.
+
+```{r}
+#| label: lisa
+
+set.seed(374)
+lisa <- localmoran_perm(pa$SIR, lw, nsim = 999)
+
+pa <- pa |>
+  mutate(
+    Ii    = lisa[, "Ii"],
+    p_sim = lisa[, "Pr(z != E(Ii)) Sim"],                     # simulation-based p
+    quad  = as.character(attr(lisa, "quadr")$mean)            # scatterplot quadrant
+  )
+
+c(mean_local = mean(pa$Ii), global = unname(mi$estimate[1]))  # same number
+```
+
+```{r}
+#| label: fig-local-I
+#| fig-height: 4
+#| fig-cap: "Local Moran's I (left) and its simulated p-value (right)."
+
+m_Ii <- ggplot(pa) +
+  geom_sf(aes(fill = Ii), colour = "white", linewidth = 0.2) +
+  scale_fill_gradient2(low = "#2166ac", mid = "grey95", high = "#b2182b", name = "Local I") +
+  labs(title = "Local I")
+
+m_p <- ggplot(pa) +
+  geom_sf(aes(fill = cut(p_sim, c(0, 0.01, 0.05, 0.1, 1))), colour = "white", linewidth = 0.2) +
+  scale_fill_manual(values = c("#7f0000", "#d7301f", "#fdbb84", "grey95"),
+                    labels = c("< 0.01", "0.01--0.05", "0.05--0.10", "> 0.10"),
+                    drop = FALSE, name = "p") +
+  labs(title = "Significance")
+
+(m_Ii | m_p) & theme_void()
+```
+
+## The LISA cluster map
+
+Combining the two maps --- quadrant for significant counties, grey otherwise ---
+gives the classic LISA map.
+
+```{r}
+#| label: fig-lisa
+#| fig-height: 4
+#| fig-cap: "SIR (left) and LISA clusters at p < 0.05 (right)."
+
+lisa_cols <- c("High-High" = "#d7191c", "Low-Low" = "#2c7bb6",
+               "High-Low"  = "#fdae61", "Low-High" = "#abd9e9",
+               "Not significant" = "grey92")
+
+pa <- pa |>
+  mutate(cluster = factor(if_else(p_sim < 0.05, quad, "Not significant"),
+                          levels = names(lisa_cols)))
+
+m_lisa <- ggplot(pa) +
+  geom_sf(aes(fill = cluster), colour = "white", linewidth = 0.2) +
+  scale_fill_manual(values = lisa_cols, drop = FALSE, name = NULL) +
+  labs(title = "LISA clusters")
+
+(m_own | m_lisa) & theme_void()
+```
+
+```{r}
+#| label: lisa-table
+
+pa |>
+  st_drop_geometry() |>
+  filter(cluster != "Not significant") |>
+  arrange(cluster, p_sim) |>
+  transmute(county, cluster, O, E = round(E, 1), SIR = round(SIR, 2),
+            Ii = round(Ii, 2), p_sim)
+```
+
+- **High-High** (hot spot): high SIR, high-SIR neighbours.
+- **Low-Low** (cold spot): low SIR, low-SIR neighbours.
+- **High-Low / Low-High** (spatial outliers): a county that breaks from its
+  surroundings.
+
+A High-High county is the *centre* of a cluster; its neighbours belong to the
+cluster but need not be significant themselves.
+
+## How much should we believe it?
+
+```{r}
+#| label: fig-lisa-strict
+#| fig-height: 4
+#| fig-cap: "LISA clusters at p < 0.05 (left) and p < 0.01 (right)."
+
+m_strict <- pa |>
+  mutate(cluster = factor(if_else(p_sim < 0.01, quad, "Not significant"),
+                          levels = names(lisa_cols))) |>
+  ggplot() +
+  geom_sf(aes(fill = cluster), colour = "white", linewidth = 0.2) +
+  scale_fill_manual(values = lisa_cols, drop = FALSE, name = NULL) +
+  labs(title = "p < 0.01")
+
+(m_lisa + labs(title = "p < 0.05") | m_strict) +
+  plot_layout(guides = "collect") & theme_void()
+```
+
+::: {.callout-warning}
+## 67 tests, not one
+At $p < 0.05$, about $0.05 \times 67 \approx 3$ counties would be flagged even
+if lung cancer risk had no spatial structure at all. Neighbouring tests also
+share data, so they are not independent. Treat LISA output as a map of places
+worth a closer look, not as a list of confirmed clusters. Clusters that survive
+a stricter threshold, involve counties with large $E_i$, and make
+epidemiological sense deserve the most attention.
+:::
+
+---
+
+# At home exercise: fifteen minutes {.unnumbered}
+
+1. Replace queen contiguity with the four nearest neighbours
+   (`knn2nb(knearneigh(st_coordinates(pts), k = 4))`). Does global I change
+   much? Does the LISA map?
+2. In the LISA table, which flagged counties have $E_i < 20$? Would you report
+   them to a county health officer? Answer in one sentence.
+3. Explain, in one sentence for a non-specialist, what a High-Low outlier
+   means.
+
+# Key takeaways {.unnumbered}
+
+1. Spatial autocorrelation needs a definition of neighbours; with
+   row-standardized weights, the spatial lag is the neighbours' average.
+2. Global Moran's I is the slope of the Moran scatterplot: one number for the
+   whole map.
+3. Permutation answers "compared to what?": shuffle the values, recompute,
+   and see where the observed I falls.
+4. Local Moran's I locates hot spots, cold spots, and outliers, using
+   conditional permutation for each county.
+5. Raw SIRs differ in reliability, and LISA runs many tests at once; read both
+   statistics with that in mind.
+
+# References {.unnumbered}
+
+Anselin, L. (1995). Local indicators of spatial association---LISA.
+*Geographical Analysis*, 27(2), 93--115.
+
+Assunção, R. M., & Reis, E. A. (1999). A new proposal to adjust Moran's I for
+population density. *Statistics in Medicine*, 18(16), 2147--2162.
+
+Bivand, R. S., & Wong, D. W. S. (2018). Comparing implementations of global
+and local indicators of spatial association. *TEST*, 27(3), 716--748.
+
+Cliff, A. D., & Ord, J. K. (1981). *Spatial processes: Models and
+applications*. Pion.
+
+Moran, P. A. P. (1950). Notes on continuous stochastic phenomena.
+*Biometrika*, 37(1/2), 17--23.
+
+Rogerson, P., & Yamada, I. (2009). *Statistical detection and surveillance of
+geographic clusters*. Chapman & Hall/CRC, Ch. 3--4.
